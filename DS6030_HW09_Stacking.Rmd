@@ -1,0 +1,297 @@
+---
+title: "Homework #9: Stacking" 
+author: "**Your Name Here**"
+date: "Due: Wed Nov 16 | 11:45am"
+output: R6030::homework
+  pdf_document:
+    toc: yes
+  html_document:
+    theme: cosmo
+    toc: yes
+    toc_float: yes
+editor_options:
+  chunk_output_type: inline
+---
+
+**DS 6030 | Fall 2022 | University of Virginia**
+
+------------------------------------------------------------------------
+
+```{r config, echo=FALSE}
+source(system.file("config/hw_config.R", package="R6030")) # knitr settings
+options(dplyr.summarise.inform = FALSE)  # ignore dplyr message about grouping
+```
+
+
+# Problem 1: Kaggle
+
+You are to make at least one official entry in the [House Prices: Advanced Regression Techniques](https://www.kaggle.com/c/house-prices-advanced-regression-techniques/overview) Kaggle contest. 
+
+- You will need to register in Kaggle (its free)
+- Read the details of the contest. Understand the data and evaluation function.
+- Make at least one submission
+- If you get a score on the public leaderboard of $\text{RMSE}<0.50$ (note RMSE is calculated on the log scale), you receive full credit, otherwise, you'll lose 10 points. 
+    - I'll allow [teaming](https://www.kaggle.com/c/house-prices-advanced-regression-techniques/team) to achieve the score, but only if everyone on the team produces a model that is used to generate the final submission (e.g., stacking or model averaging)
+- Submit the following in Collab:
+    - Code
+    - kaggle name (or team name) so we can ensure you had a valid submission. 
+    - your score and current ranking on the kaggle leaderboard
+- Top 5 scores get 2 bonus points
+    - Teams will split their bonus points among team members
+    
+Load data and library    
+```{r}
+data.dir = 'https://mdporter.github.io/DS6030/data/' # data directory
+library(mlbench)
+library(glmnet)
+library(R6030)     # functions for DS-6030
+library(tidyverse) # functions for data manipulation   
+```
+# Load Data
+
+Load test/train data 
+```{r}
+test_data <- read.csv("C:\\Users\\brwil\\Desktop\\SY MSDS\\DS 6030 Stat Learning\\Week 10_11\\test.csv", header=TRUE,stringsAsFactors=FALSE)
+train_data <- read.csv("C:\\Users\\brwil\\Desktop\\SY MSDS\\DS 6030 Stat Learning\\Week 10_11\\train.csv", header=TRUE,stringsAsFactors=FALSE)
+
+```
+
+
+# Pre Processing
+
+```{r}
+library("DataExplorer")
+library("data.table")
+library("mltools")
+library("ggplot2")
+```
+
+```{r}
+plot_missing(train_data[,0:30])
+
+```
+
+```{r}
+# function to map categorical to numeric
+map.values <- function(cols, map.list, df){
+  for (col in cols){
+    df[[col]] <- as.numeric(map.list[df[,col]])
+  }
+  return(df)
+}
+
+#map numeric values to categorical data
+qual.cols <- c('ExterQual', 'ExterCond', 'GarageQual', 'GarageCond', 'KitchenQual', 'HeatingQC', 'BsmtQual', 'BsmtCond')
+qual.list <- c('Po' = 1, 'Fa' = 2, 'TA' = 3, 'Gd' = 4, 'Ex' = 5)
+train_data <- map.values(qual.cols, qual.list, train_data)
+train_data$GarageGrade <- train_data$GarageQual * train_data$GarageCond
+train_data$KitchenScore <- train_data$KitchenAbvGr * train_data$KitchenQual
+train_data$ExterGrade <- train_data$ExterQual * train_data$ExterCond
+train_data$CentralAir=ifelse(train_data$CentralAir=="Y",1,0)
+train_data$CentralAir <- as.integer(train_data$CentralAir)
+
+#single column and remove old columns: area
+train_data$FinalArea<-train_data$X1stFlrSF+train_data$X2ndFlrSF+train_data$TotalBsmtSF
+
+#single column and remove old columns: square footage
+train_data$FinalSqFt<-train_data$BsmtFinSF1+train_data$BsmtFinSF2+train_data$X1stFlrSF+train_data$X2ndFlrSF
+train_data$BsmtFinSF1<-NULL
+train_data$BsmtFinSF2<-NULL
+train_data$GrLivArea<-NULL
+train_data$X1stFlrSF<-NULL
+train_data$X2ndFlrSF<-NULL
+
+#single column and remove old columns: condition
+train_data$QC<-(train_data$OverallCond*train_data$OverallQual)/100
+train_data$OverallCond<-NULL
+train_data$OverallQual<-NULL
+
+#single column and remove old columns: bathroom
+train_data$BR<-train_data$BsmtFullBath+(0.5*train_data$BsmtHalfBath)+train_data$FullBath+(0.5*train_data$HalfBath)
+train_data$BsmtFullBath<-NULL
+train_data$BsmtHalfBath<-NULL
+train_data$HalfBath<-NULL
+train_data$FullBath<-NULL
+
+#single column and remove old columns: porch
+train_data$Porch<-train_data$OpenPorchSF+train_data$EnclosedPorch+train_data$X3SsnPorch+train_data$ScreenPorch+train_data$WoodDeckSF
+train_data$OpenPorchSF<-NULL
+train_data$EnclosedPorch<-NULL
+train_data$X3SsnPorch<-NULL
+train_data$ScreenPorch<-NULL
+train_data$WoodDeckSF<-NULL
+
+#property has pool
+train_data <- mutate(train_data, Pool = ifelse(PoolArea > 0, 1, 0))
+
+#replace NA values with 0 (not existent)
+train_data$GarageCars[is.na(train_data$GarageCars)]<- 0
+train_data$BsmtUnfSF[is.na(train_data$BsmtUnfSF)]<-0
+train_data$LotFrontage[is.na(train_data$LotFrontage)]<-0
+train_data$GarageArea[is.na(train_data$GarageArea)]<-0
+train_data$MasVnrArea[is.na(train_data$MasVnrArea)]<- 0
+
+#replace NA values with mean
+train_data$SaleType[is.na(train_data$SaleType)]<-mode(train_data$SaleType)
+train_data$FinalSqFt[is.na(train_data$TotalArea)]<-mean(train_data$TotalArea,na.rm=TRUE)
+train_data$BR[is.na(train_data$TotBath)]<-mean(train_data$TotBath,na.rm = TRUE)
+train_data$KitchenQual[is.na(train_data$KitchenQual)]<-train_data$HeatingQC[is.na(train_data$KitchenQual)]
+
+#GarageYrBlt NAs input YearBuilt
+train_data$GarageYrBlt[is.na(train_data$GarageYrBlt)]<-train_data$YearBuilt[is.na(train_data$GarageYrBlt)]
+
+#remove ID and Month Sold fields
+train_data$Id<-NULL
+train_data$MoSold<-NULL
+
+```
+
+```{r}
+#log features
+train_data$LotFrontage = log(train_data$LotFrontage)
+train_data$LotArea = log(train_data$LotArea)
+train_data$SalePrice = log(train_data$SalePrice)
+```
+
+
+```{r}
+#loop to ID cat var with high mode
+repvalues=function(x){
+  check=table(x, useNA = "always")
+  check2=check[which.max(check)]
+  return (cbind(check2,len=length(x)))
+}
+
+#run loop on data
+useless_var=function(x){
+  mode_count=t(sapply(x,function(y)repvalues(y)))
+  return (mode_count)
+}
+
+u<-useless_var(train_data)
+per<-data.frame(u[,1]/u[,2])
+colnames(per)<-"Per"
+head(per)
+```
+
+```{r}
+#remove high mode or not applicable features
+train_data <- train_data[,!names(train_data) %in% c("Street", "Alley", "Utilities", "LandSlope", "Condition2", "RoofMatl", "Heating", "CentralAir", "Electrical", "LowQualFinSF", "KitchenAbvGr", "Functional", "PavedDrive", "GarageCond", "MiscVal", "MiscFeature")]
+
+```
+
+
+# Create Values for Model
+
+Set Up X, Y Values
+```{r}
+set.seed(1994)
+
+#-- Get model matrices (returns a list of `x` and `xtest`)
+#set folds
+n.folds = 50
+
+#create glmnet matrix
+X = glmnet::makeX(
+  train = train_data %>% select(-SalePrice),
+  test = train_data %>% select(-SalePrice)
+  )
+
+X.train = X$x
+Y.train = train_data %>% pull(SalePrice)
+
+X.test = X$x
+Y.test = train_data %>% pull(SalePrice)
+
+#create folds
+fold = sample(rep(1:n.folds, length=nrow(X.train)))
+
+```
+
+
+#ID Optimal Inputs
+
+ID optimal alpha
+```{r}
+#loop lambda values
+models <- list()
+for (i in 0:20) {
+  name <- paste0("alpha", i/20)
+  
+
+  models[[name]] <-
+    cv.glmnet(X.train, Y.train, type.measure="mse", alpha=i/20, 
+              family="gaussian")
+}
+
+#predict results
+results <- data.frame()
+for (i in 0:20) {
+  name <- paste0("alpha", i/20)
+  
+  ## Use each model to predict 'y' given the Testing dataset
+  predicted <- predict(models[[name]], 
+                       s=models[[name]]$lambda.1se, newx=X.test)
+  
+  ## Calculate the Mean Squared Error...
+  mse <- mean((Y.test - predicted)^2)
+  
+  ## Store the results
+  temp <- data.frame(alpha=i/20, mse=mse, name=name)
+  results <- rbind(results, temp)
+}
+
+#print results
+print(results)
+
+```
+
+Print and plot results of alpha values
+```{r}
+#print results
+print(results)
+
+#plot results
+plot(results$alpha, results$mse)
+```
+
+Determine optimal alpha (min returned)
+```{r}
+#min results
+results %>% slice_min(mse)
+
+```
+
+# Elastic Net
+
+Establish Cross Fold Evaluation
+```{r}
+#- Get K-fold partition (so consistent to all models)
+set.seed(1994) # set seed for replicability
+n.folds = 50 # number of folds for cross-validation
+fold = sample(rep(1:n.folds, length=nrow(X.train)))
+
+```
+
+Fit Elastic Net
+```{r}
+#-- Elastic Net
+a = .25 # set alpha for elastic net
+fit.enet = cv.glmnet(X.train, Y.train, alpha=a, foldid=fold)
+beta.enet = coef(fit.enet, s="lambda.min")
+yhat.enet = predict(fit.enet, newx = X.test, s="lambda.min")
+
+```
+
+RMSE
+```{r}
+elastic_net_final = glmnet(X.train, Y.train, alpha = 0.25, lambda = "lambda.min")
+en_predict = predict(elastic_net_final, X.test, s = "lambda.lse")
+en_resid = train_data$SalePrice - en_predict
+sqrt(mean(en_resid^2, na.rm = TRUE))
+
+```
+
+
+
+
